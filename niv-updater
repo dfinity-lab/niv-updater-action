@@ -25,11 +25,68 @@ setupPrerequisites() {
 
     # Check if some other step already installed Nix
     if [[ ! -d /nix/store ]] || ! nix --version >/dev/null 2>&1; then
-        sudo mkdir -p /etc/nix
-        # Workaround segfault: https://github.com/NixOS/nix/issues/2733
-        sudo sh -c 'echo "http2 = false" >> /etc/nix/nix.conf'
+        # Create a temporary workdir
+        workdir=$(mktemp -d)
+        trap 'rm -rf "$workdir"' EXIT
 
-        sh <(curl -sSL https://nixos.org/nix/install) --no-daemon
+        # Configure Nix
+        add_config() {
+            echo "$1" >>"$workdir/nix.conf"
+        }
+
+        # Workaround segfault: https://github.com/NixOS/nix/issues/2733
+        add_config "http2 = false"
+
+        add_config "max-jobs = auto"
+        if [[ $OSTYPE =~ darwin ]]; then
+            add_config "ssl-cert-file = /etc/ssl/cert.pem"
+        fi
+        # Allow binary caches for user
+        add_config "trusted-users = root ${USER:-}"
+        add_config "experimental-features = nix-command flakes"
+        # Add a GitHub access token.
+        # Token-less access is subject to lower rate limits.
+        # Use the default GitHub token if available.
+        # Skip this step if running an Enterprise instance. The default token there does not work for github.com.
+        if [[ -n ${GITHUB_TOKEN:-} && $GITHUB_SERVER_URL == "https://github.com" ]]; then
+            echo "::debug::Using the default GITHUB_TOKEN for github.com"
+            add_config "access-tokens = github.com=$GITHUB_TOKEN"
+        else
+            echo "::debug::Continuing without a GitHub access token"
+        fi
+        # Nix installer flags
+        installer_options=(
+            --no-channel-add
+            --darwin-use-unencrypted-nix-store-volume
+            --nix-extra-conf-file "$workdir/nix.conf"
+            --no-daemon
+        )
+
+        # "fix" the following error when running nix*
+        # error: the group 'nixbld' specified in 'build-users-group' does not exist
+        add_config "build-users-group ="
+        sudo mkdir -p /etc/nix
+        sudo chmod 0755 /etc/nix
+        sudo cp "$workdir/nix.conf" /etc/nix/nix.conf
+
+        # There is --retry-on-errors, but only newer curl versions support that
+        curl_retries=5
+        # pin to ensure future upgrades do not interfere with the subsequent steps
+        while ! curl -sS -o "$workdir/install" -v --fail -L "https://releases.nixos.org/nix/nix-2.24.9/install"; do
+            sleep 1
+            ((curl_retries--))
+            if [[ $curl_retries -le 0 ]]; then
+                echo "curl retries failed" >&2
+                exit 1
+            fi
+        done
+
+        sh "$workdir/install" "${installer_options[@]}"
+
+        # Set paths
+        echo "/nix/var/nix/profiles/default/bin" >>"$GITHUB_PATH"
+        # new path for nix 2.14
+        echo "$HOME/.nix-profile/bin" >>"$GITHUB_PATH"
     fi
 
     echo 'Installing Nix - done'
@@ -37,16 +94,30 @@ setupPrerequisites() {
 
     export PATH="${PATH}:/nix/var/nix/profiles/per-user/runner/profile/bin:/nix/var/nix/profiles/default/bin"
 
-    # shellcheck disable=SC1090
-    source "${HOME}/.nix-profile/etc/profile.d/nix.sh"
+    # shellcheck disable=SC1091
+    test -f "${HOME}/.nix-profile/etc/profile.d/nix.sh" && source "${HOME}/.nix-profile/etc/profile.d/nix.sh"
 
-    # we also need hub, and git, but they both come with ubuntu-latest with GitHub Actions
-    # https://github.com/actions/virtual-environments/blob/master/images/linux/Ubuntu1804-README.md
-    nix-env -iA niv -f "https://github.com/nmattia/niv/tarball/$INPUT_NIV_VERSION" \
-        --substituters https://niv.cachix.org \
-        --trusted-public-keys niv.cachix.org-1:X32PCg2e/zAm3/uD1ScqW2z/K0LtDyNV7RdaxIuLgQM=
+    PACKAGES=(jq moreutils curl)
+    if [[ $INPUT_NIV_VERSION == "*from-nixpkgs*" ]]; then
+        PACKAGES+=(niv)
+    else
+        # we also need hub, and git, but they both come with ubuntu-latest with GitHub Actions
+        # https://github.com/actions/virtual-environments/blob/master/images/linux/Ubuntu1804-README.md
+        # NOTE: We add 'cache.nixos.org' as a substituter because niv uses it as an upstream cache:
+        # https://blog.cachix.org/posts/2020-07-28-upstream-caches-avoiding-pushing-paths-in-cache-nixos-org/
+        nix-env -iA niv -f "https://github.com/nmattia/niv/tarball/$INPUT_NIV_VERSION" \
+            --substituters 'https://niv.cachix.org https://cache.nixos.org' \
+            --trusted-public-keys 'niv.cachix.org-1:X32PCg2e/zAm3/uD1ScqW2z/K0LtDyNV7RdaxIuLgQM= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY='
+    fi
     # We need --rawfile for jq, available in jq 1.6, which is only available on ubuntu 20.04 and macos
-    nix-env -iA nixpkgs.jq
+    # We need moreutils because of the sponge utility (to simplify the code)
+
+    # Install if hub dependency is missing on self hosted runner
+    [[ $(type -P "hub") ]] || PACKAGES+=(hub)
+
+    # shellcheck disable=SC2016
+    PATH="${PATH}:$(nix-shell -I "nixpkgs=https://github.com/NixOS/nixpkgs/archive/refs/heads/nixos-24.05.tar.gz" -p "${PACKAGES[@]}" --command 'echo $PATH')"
+
     echo 'Installing dependencies - done'
 }
 
@@ -126,17 +197,16 @@ formatIssueLinksPlain() {
 }
 
 # Like formatIssuesLinkPlain, this function turns any #123 a direct reference to the original repository.
-# Unlike formatIssuesLink, it will use a redirection service (DuckDuckGo), so that referenced PRs/Issues
+# Unlike formatIssuesLink, it will use a redirection service (togithub.com), so that referenced PRs/Issues
 # do not contain back references.
 # For more details, see https://github.com/knl/niv-updater-action/issues/26
-# NOTE: It has to be http://r.duckduckgo.com, https variant will not redirect
 formatIssueLinksNoBackreferences() {
     dep_owner="$1"
     dep_repo="$2"
     # The sequence e2 81 a0 is \u2060 - UNICODE WORD JOINER
     # We need it in order prevent GitHub from making a backreference due to
     # the commit message text.
-    sed "s~#\([0-9]\+\)~[$dep_owner/$dep_repo\xe2\x81\xa0#\1](http://r.duckduckgo.com/l/?uddg=https://github.com/$dep_owner/$dep_repo/issues/\1)~g"
+    sed "s~#\([0-9]\+\)~[$dep_owner/$dep_repo\xe2\x81\xa0#\1](https://togithub.com/$dep_owner/$dep_repo/issues/\1)~g"
 }
 
 # This function formats mentions in the generated changelog in such a way that
@@ -160,7 +230,8 @@ formatIssueLinks() {
 createPullRequestsOnUpdate() {
     echo 'Checking for updates'
     if [[ -z $INPUT_PULL_REQUEST_BASE ]]; then
-        INPUT_PULL_REQUEST_BASE="$GITHUB_REF"
+        INPUT_PULL_REQUEST_BASE="${GITHUB_REF#refs/heads/}"
+        INPUT_PULL_REQUEST_BASE="${INPUT_PULL_REQUEST_BASE#refs/tags/}"
         base="$GITHUB_SHA"
     else
         # get the SHA of the current base, so that it remains fixed during the run
@@ -338,22 +409,36 @@ createPullRequestsOnUpdate() {
                 printf 'Branch: %s\n' "$niv_branch"
                 printf 'Commits: [%s/%s@%.8s...%.8s](https://github.com/%s/%s/compare/%s...%s)\n\n' "$dep_owner" "$dep_repo" "$revision" "$new_revision" "$dep_owner" "$dep_repo" "$revision" "$new_revision"
                 {
-                    hub api "/repos/$dep_owner/$dep_repo/compare/${revision}...${new_revision}" || true
+                    # In order for this to work, one has to use both paginate and per_page
+                    hub api --paginate "/repos/$dep_owner/$dep_repo/compare/${revision}...${new_revision}?per_page=100" || true
                 } | jq -r '.commits[] '"$merges_filter"' | "* [`\(.sha[0:8])`](\(.html_url)) \(.commit.message | split("\n") | first)"' \
                     | formatIssueLinks "$dep_owner" "$dep_repo" \
                     | formatMentions
             } >>"$message"
         fi
 
-        # print with a new line appended, as yaml swallows those
-        printf '%s%s' "$INPUT_MESSAGE_SUFFIX" "${INPUT_MESSAGE_SUFFIX:+$'\n'}" >>"$message"
+        message_size=$(wc -c <"$message")
+        truncation_string="* ... _the rest of the list is truncated due to the maximum length of the PR message on GitHub. Please take a look at the commit message._"
+        max_message_size=$((65536 - ${#INPUT_MESSAGE_SUFFIX} - 1 - ${#truncation_string} - 1))
 
+        # This is now split in two different, interleaved actions:
+        # - generating the commit message of any size
+        # - generating the PR description with max size of 64k
         commit_message=$(mktemp)
         {
             cat "$title"
             printf '\n\n'
             cat "$message"
+            # print with a new line appended, as yaml swallows those
+            printf '%s%s' "$INPUT_MESSAGE_SUFFIX" "${INPUT_MESSAGE_SUFFIX:+$'\n'}"
         } >"$commit_message"
+
+        if ((message_size > max_message_size)); then
+            head <"$message" -c $max_message_size | sed '$d' | sponge "$message"
+            printf "%s\n" "$truncation_string" >>"$message"
+        fi
+        # print with a new line appended, as yaml swallows those
+        printf '%s%s' "$INPUT_MESSAGE_SUFFIX" "${INPUT_MESSAGE_SUFFIX:+$'\n'}" >>"$message"
 
         new_content=$(mktemp)
         base64 "$wdir/$SOURCES_JSON" >>"$new_content"
@@ -362,11 +447,12 @@ createPullRequestsOnUpdate() {
         if [[ $branch_exists == 'no' ]]; then
             # create the branch
             echo "Creating branch '$branch_name' for the update of '$dep'"
+            hub_api_out=$(mktemp)
             if ! hub api \
                 -F ref="refs/heads/$branch_name" \
                 -F sha="$base" \
-                "/repos/$GITHUB_REPOSITORY/git/refs" >/dev/null; then
-                error "could not create branch $branch_name"
+                "/repos/$GITHUB_REPOSITORY/git/refs" >"$hub_api_out"; then
+                error "could not create branch $branch_name for base $base, due to $(cat "$hub_api_out")"
             fi
 
             # upload the content
@@ -537,10 +623,11 @@ createPullRequestsOnUpdate() {
 
 if [[ $INPUT_DEBUG_OUTPUT == 'true' ]]; then
     set -x
+    export HUB_VERBOSE=true
 fi
 
-checkCredentials
 setupPrerequisites
+checkCredentials
 setupNetrc
 sanitizeInputs
 createPullRequestsOnUpdate
